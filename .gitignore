@@ -1,0 +1,9 @@
+# Xcode / Swift
+xcuserdata/
+DerivedData/
+build/
+*.xcuserstate
+*.xcuserdatad/
+.DS_Store
+# XcodeGen 生成物（不入库，由 project.yml 生成）
+ios/StreamFlow.xcodeproj/

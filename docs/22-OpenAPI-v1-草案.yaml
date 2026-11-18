@@ -1,0 +1,979 @@
+# StreamFlow OpenAPI v1 草案
+# 状态：草案 v0.3 · 2026-11-16 · 配套 docs/24-v3-规格草案-r5.md（§2）
+# r5 变更：TaskCreateHttp 增 resolve 字段；/play-urls 增 path 入参与绝对 URL 说明；
+#          新增通用 401/403 响应组件并挂到主要端点（其余 /api/* 端点同样适用）。
+# 性质：纯设计文档，仅存在于 docs/，不含任何服务端实现。
+# 约定：
+#   - 所有 /api/* 路径要求 Bearer API Key（权限 read/write/admin）。
+#   - 播放地址 /play/*、/proxy/play/* 走签名 URL 体系，不在本文件内（见规格 §3）。
+#   - 所有路径参数（save_path / path）一律为相对白名单根目录的相对路径；API 不接收、不返回绝对路径。
+#   - 错误结构统一：{"error": {"code": "...", "message": "..."}}
+#   - 稳定错误码：unauthorized / permission_denied / invalid_path / path_not_allowed /
+#     duplicate_task / invalid_state / page_url_unsupported_in_v1 / torrent_too_large / rate_limited
+openapi: 3.1.0
+info:
+  title: StreamFlow Server API
+  version: 1.0.0-draft
+  description: |
+    StreamFlow V1 服务端 API 草案。定位：个人媒体备份与管理。
+    V1.0 仅支持 HTTP 直链下载；页面/播放页链接返回 422 page_url_unsupported_in_v1，
+    由 V1.1 的 yt-dlp 解析适配层接管。
+servers:
+  - url: http://{host}:{port}/api/v1
+    variables:
+      host:
+        default: 192.0.2.10
+      port:
+        default: "8080"
+security:
+  - bearerAuth: []
+tags:
+  - name: system
+    description: 健康检查
+  - name: downloads
+    description: 下载任务
+  - name: files
+    description: 文件列表
+  - name: keys
+    description: API Key 管理（admin）
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: 健康检查
+      security: []
+      responses:
+        "200":
+          description: 服务正常与否的快照
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, version, backend]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok, degraded]
+                  version:
+                    type: string
+                  backend:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type:
+                        type: string
+                        const: http
+                      status:
+                        type: string
+                        enum: [ok, error]
+                  bt_backend:
+                    type: object
+                    required: [enabled]
+                    properties:
+                      enabled:
+                        type: boolean
+                      type:
+                        type: string
+                        nullable: true
+                        enum: [aria2, qbittorrent, transmission, null]
+                      status:
+                        type: string
+                        nullable: true
+
+  /downloads:
+    post:
+      tags: [downloads]
+      summary: 创建下载任务
+      description: |
+        支持三种载体：HTTP 直链（JSON）、磁力链接（JSON）、种子文件（multipart）。
+        - `type` 可省略，由服务端自动识别。
+        - 幂等：可带 `Idempotency-Key` 请求头或 `idempotency_key` 字段；同 key 重复提交返回同一任务。
+        - URL 去重：无幂等键时按 `url + save_path` 查重，命中返回 409 duplicate_task；
+          并发多建需显式 `allow_duplicate=true`。
+        - V1.0 页面链接边界：目标响应 Content-Type 为 text/html 等 HTML 类型时，
+          不创建任务，返回 422 page_url_unsupported_in_v1（错误信息注明需 V1.1 yt-dlp）。
+        - `headers` 仅本任务使用，敏感值不落审计日志明文。
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/TaskCreateHttp"
+                - $ref: "#/components/schemas/TaskCreateMagnet"
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                type:
+                  type: string
+                  enum: [torrent]
+                file:
+                  type: string
+                  format: binary
+                  description: .torrent 文件，服务端限制大小（建议 ≤ 1 MiB，超限 413 torrent_too_large）
+                save_path:
+                  type: string
+                  description: 相对白名单根目录的相对路径
+      responses:
+        "201":
+          description: 任务已创建
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "200":
+          description: 幂等命中，返回已有任务
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "409":
+          description: duplicate_task（附带已有任务 ID）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - type: object
+                    properties:
+                      existing_task_id:
+                        type: string
+                        format: uuid
+        "413":
+          description: torrent_too_large（种子文件超限）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: |
+            页面链接（非直链）：page_url_unsupported_in_v1（r4：错误信息注明需 V1.1 yt-dlp）；
+            或参数校验失败：invalid_request。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "400":
+          description: |
+            请求格式错误：invalid_header（headers 含允许名单之外的键，
+            Host/Content-Length/Transfer-Encoding/Connection/Upgrade/Expect/TE/Trailer/
+            Authorization/Proxy-* 永久禁止）；invalid_path（save_path 为绝对路径或含 .. 等非法形态）。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: |
+            permission_denied（key 权限不足，write 及以上才能建任务）；
+            path_not_allowed（save_path 规范化后越出白名单）。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: |
+            rate_limited（请求频率或并发创建超限；带 Retry-After 响应头，建议）。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    get:
+      tags: [downloads]
+      summary: 查询任务列表
+      parameters:
+        - name: state
+          in: query
+          schema:
+            $ref: "#/components/schemas/TaskState"
+        - name: batch_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: r4：多P/播放列表批量任务的批次过滤（规格 §8.5）
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 任务列表（游标分页）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Task"
+                  next_cursor:
+                    type: string
+                    nullable: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /play-urls:
+    post:
+      tags: [downloads]
+      summary: 获取播放地址（r4 新增，规格 §2.7/§3）
+      description: |
+        为 media_id 或白名单内文件 path 签发带签名的播放 URL（/play/* 或 /proxy/play/*）。
+        sig = HMAC-SHA256(key, media_id + expires [+ session_id])，必须覆盖 media_id 与 expires。
+        电视/播放器只拿返回的 play_url，不调用本 API；本接口需 Bearer Key（read 及以上）。
+        配置 public_base_url 时 play_url 为绝对 URL（DLNA 投屏必需，规格 §1.6/§3.3）；
+        未配置时为相对形态。
+        失效判定顺序见规格 §3.4：invalid_sig → expired → session_gone。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [media_id]
+                  properties:
+                    media_id:
+                      type: string
+                      format: uuid
+                    mode:
+                      type: string
+                      enum: [local, proxy]
+                      description: 省略时服务端按 media_id 类型自动选择
+                - type: object
+                  required: [path]
+                  description: |
+                    r5：按白名单内相对路径取播放地址；服务端校验白名单与可播性后
+                    按需登记 media_id（已登记则复用），规格 §2.7/§3.2。
+                  properties:
+                    path:
+                      type: string
+                      description: 相对白名单根目录的相对路径
+                    mode:
+                      type: string
+                      enum: [local, proxy]
+      responses:
+        "200":
+          description: 签发成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [play_url, expires, mode]
+                properties:
+                  play_url:
+                    type: string
+                    description: |
+                      配置 public_base_url 时为绝对 URL（如 http://192.0.2.10:8080/play/{media_id}?...）；
+                      未配置时为相对形态（/play/{media_id}?token=...&expires=...&sig=...），host 由调用方拼接。
+                  expires:
+                    type: integer
+                    description: 签名 URL 过期时间（Unix 秒，建议默认 8h）
+                  session_expires:
+                    type: integer
+                    description: 会话令牌过期时间（建议默认 24h）
+                  mode:
+                    type: string
+                    enum: [local, proxy]
+        "404":
+          description: media_not_found（media_id 不存在或已失效）/ file_not_found（path 形式下文件不存在）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: path_not_allowed（path 形式下越出白名单）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: unsupported_mode（如对远端源请求 local）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /resolve/preview:
+    post:
+      tags: [downloads]
+      summary: 解析预览（r4 新增，V1.1 起可用，规格 §2.8/§8.3）
+      description: |
+        调 yt-dlp 提取元数据与可用格式列表，不创建任何任务。
+        V1.0 阶段返回 404 not_available_until_v1_1。
+        同 URL 结果短时缓存（建议 10 分钟）；预览出站经 SSRF 过滤代理（规格 §4.3）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: 解析结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [preview_id, title]
+                properties:
+                  preview_id:
+                    type: string
+                    description: 预览结果引用，建任务时传 resolve.preview_id
+                  title:
+                    type: string
+                  duration_s:
+                    type: number
+                    nullable: true
+                  thumbnail_url:
+                    type: string
+                    nullable: true
+                  entries:
+                    type: array
+                    nullable: true
+                    description: 多P/播放列表条目（规格 §8.5）；单视频为 null
+                    items:
+                      type: object
+                      properties:
+                        index:
+                          type: integer
+                        title:
+                          type: string
+                        duration_s:
+                          type: number
+                        url:
+                          type: string
+                  formats:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MediaFormat"
+        "404":
+          description: not_available_until_v1_1（V1.0 阶段）；或解析失败（无该页面的媒体）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /downloads/{id}:
+    get:
+      tags: [downloads]
+      summary: 查询单个任务
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: 任务对象
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "404":
+          description: 任务不存在
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /downloads/{id}/cancel:
+    post:
+      tags: [downloads]
+      summary: 取消任务（幂等）
+      description: 对已结束任务返回 200，不报错。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: 已取消或本已结束
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "404":
+          description: 任务不存在
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /downloads/{id}/retry:
+    post:
+      tags: [downloads]
+      summary: 重试任务
+      description: 仅对 failed 任务合法，否则 409 invalid_state。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: 重试已受理（任务回到 queued）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "409":
+          description: invalid_state（任务不在 failed 状态）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: 任务不存在
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /downloads/{id}/files:
+    get:
+      tags: [downloads]
+      summary: 列出 BT 任务候选文件
+      description: 仅 meta_info / selecting 阶段可用。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: 候选文件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TaskFile"
+        "409":
+          description: invalid_state（当前阶段不可列文件）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      tags: [downloads]
+      summary: 提交文件选择
+      description: |
+        在 meta_info（交互模式）阶段提交要下载的文件子集；
+        提交后任务进入 selecting，后端确认后转 downloading。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [select]
+              properties:
+                select:
+                  type: array
+                  items:
+                    type: string
+                  description: 文件索引或任务内相对路径
+      responses:
+        "202":
+          description: 选择已受理
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "409":
+          description: invalid_state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /downloads/{id}/seed:
+    post:
+      tags: [downloads]
+      summary: 做种控制（BT）
+      description: |
+        默认下载完成后停止做种。enable=true 时可设 ratio / seed_time_min 上限。
+      parameters:
+        - $ref: "#/components/parameters/TaskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enable]
+              properties:
+                enable:
+                  type: boolean
+                ratio:
+                  type: number
+                  description: 做种分享率上限
+                seed_time_min:
+                  type: integer
+                  description: 做种时长上限（分钟）
+      responses:
+        "200":
+          description: 设置已生效
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "409":
+          description: invalid_state（非 BT 任务）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /files:
+    get:
+      tags: [files]
+      summary: 文件列表
+      description: |
+        `path` 为相对白名单根目录的相对路径；省略表示根目录。
+        出现绝对路径、`..`、反斜杠等 → 400 invalid_path；
+        规范化后越出白名单 → 403 path_not_allowed。
+      parameters:
+        - name: path
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: recursive
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            maximum: 500
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 文件条目（游标分页）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FileEntry"
+                  next_cursor:
+                    type: string
+                    nullable: true
+        "400":
+          description: invalid_path（格式非法）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: path_not_allowed（越出白名单）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /admin/keys:
+    get:
+      tags: [keys]
+      summary: 列出 API Key（admin）
+      description: 只返回元数据与哈希前缀，不返回 key 明文。
+      responses:
+        "200":
+          description: Key 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ApiKey"
+    post:
+      tags: [keys]
+      summary: 创建 API Key（admin）
+      description: 明文 key 仅在本次响应返回一次；服务端只存哈希。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scope]
+              properties:
+                name:
+                  type: string
+                scope:
+                  type: string
+                  enum: [read, write, admin]
+                expires_at:
+                  type: string
+                  format: date-time
+                  nullable: true
+      responses:
+        "201":
+          description: 已创建（含一次性明文 key）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, meta]
+                properties:
+                  key:
+                    type: string
+                    description: 明文 key，仅此一次返回
+                  meta:
+                    $ref: "#/components/schemas/ApiKey"
+
+  /admin/keys/{id}/rotate:
+    post:
+      tags: [keys]
+      summary: 轮换 API Key（admin）
+      description: |
+        吊销旧 key 并签发新 key（新明文仅本次返回一次）。
+        用于初始 admin key 经 stdout 明文展示后的轮换（规格 §1.2）。
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "201":
+          description: 已轮换（含一次性新明文 key）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, meta]
+                properties:
+                  key:
+                    type: string
+                  meta:
+                    $ref: "#/components/schemas/ApiKey"
+        "404":
+          description: Key 不存在
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /admin/keys/{id}:
+    delete:
+      tags: [keys]
+      summary: 吊销 API Key（admin）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: 已吊销
+        "404":
+          description: Key 不存在
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: API Key，分 read / write / admin 三级权限
+  responses:
+    Unauthorized:
+      description: 未认证（缺 Bearer 或 key 无效）；error.code = unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PermissionDenied:
+      description: 已认证但权限不足（403 permission_denied）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  parameters:
+    TaskId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: 稳定错误码（见文件头注释清单）
+            message:
+              type: string
+    TaskState:
+      type: string
+      enum: [queued, meta_info, selecting, downloading, seeding, completed, stopped, failed, canceled]
+      description: meta_info/selecting/seeding 为 BT 特有；stopped 为用户手动停止做种
+    TaskCreateHttp:
+      type: object
+      required: [url]
+      properties:
+        type:
+          type: string
+          enum: [http]
+          description: 可省略，由服务端自动识别
+        url:
+          type: string
+          format: uri
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            每任务自定义请求头（Referer/UA/Cookie）；V1 唯一凭据注入方式。
+            r4 允许名单（大小写不敏感）：Referer / User-Agent / Origin / Accept /
+            Accept-Language / Cookie；名单外 → 400 invalid_header；
+            Host、Content-Length、Transfer-Encoding、Connection、Upgrade、Expect、
+            TE、Trailer、Authorization、Proxy-* 永久禁止（规格 §2.4）。
+        save_path:
+          type: string
+          description: 相对白名单根目录的相对路径；省略落到根目录
+        idempotency_key:
+          type: string
+        allow_duplicate:
+          type: boolean
+          default: false
+        resolve:
+          type: object
+          nullable: true
+          description: |
+            r5：由解析预览（POST /resolve/preview）派生的任务（方案 A：resolver 沙箱解析并下载，
+            规格 §8）。提供 resolve 时 url 应为通用/页面链接。
+          properties:
+            preview_id:
+              type: string
+              format: uuid
+            format_id:
+              type: string
+              description: 选定格式；省略 = 最佳
+            audio_format_id:
+              type: string
+              nullable: true
+              description: 分轨时指定音频格式（规格 §8.4）
+    TaskCreateMagnet:
+      type: object
+      required: [magnet]
+      properties:
+        type:
+          type: string
+          enum: [magnet]
+        magnet:
+          type: string
+        save_path:
+          type: string
+        idempotency_key:
+          type: string
+        allow_duplicate:
+          type: boolean
+          default: false
+    Task:
+      type: object
+      required: [id, type, state, created_at, progress]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [http, magnet, torrent]
+        batch_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: r4：所属批量任务批次（多P/播放列表创建时共享，规格 §8.5）
+        state:
+          $ref: "#/components/schemas/TaskState"
+        created_at:
+          type: string
+          format: date-time
+        progress:
+          type: number
+          minimum: 0
+          maximum: 1
+        url:
+          type: string
+          nullable: true
+        magnet:
+          type: string
+          nullable: true
+          description: 审计/日志中整体打码；API 响应原样返回给任务创建者
+        files:
+          type: array
+          nullable: true
+          items:
+            $ref: "#/components/schemas/TaskFile"
+        save_path:
+          type: string
+          description: 相对白名单根目录的相对路径（r3 口径：不返回绝对路径）
+        error:
+          $ref: "#/components/schemas/Error"
+        size_bytes:
+          type: integer
+          nullable: true
+        downloaded_bytes:
+          type: integer
+          nullable: true
+    TaskFile:
+      type: object
+      required: [index, path, size_bytes, selected]
+      properties:
+        index:
+          type: integer
+        path:
+          type: string
+          description: 任务内相对路径
+        size_bytes:
+          type: integer
+        selected:
+          type: boolean
+    FileEntry:
+      type: object
+      required: [name, path, is_dir, size_bytes, modified_at]
+      properties:
+        name:
+          type: string
+        path:
+          type: string
+          description: 相对白名单根目录的相对路径
+        is_dir:
+          type: boolean
+        size_bytes:
+          type: integer
+        modified_at:
+          type: string
+          format: date-time
+        mime:
+          type: string
+          nullable: true
+        playable:
+          type: boolean
+          nullable: true
+          description: 判定依据待定（V1 先用扩展名白名单）
+        media_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            r4：服务端内部媒体资源 ID，用于 POST /play-urls（规格 §3.2）。
+            本地文件在任务 completed 并通过白名单校验后自动登记；
+            不可播放或未登记为 null。不暴露源站 URL。
+    ApiKey:
+      type: object
+      required: [id, name, scope, created_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        scope:
+          type: string
+          enum: [read, write, admin]
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        hash_prefix:
+          type: string
+          description: 哈希前若干位，用于人工辨识，非明文 key
+    MediaFormat:
+      type: object
+      required: [format_id, ext]
+      description: r4：画质/格式条目（规格 §8.4）
+      properties:
+        format_id:
+          type: string
+          description: yt-dlp 原生格式 ID
+        ext:
+          type: string
+          description: 容器格式 mp4 / webm / m4a ...
+        vcodec:
+          type: string
+          nullable: true
+          description: 视频编码 avc1/hevc/vp9；none = 纯音频
+        acodec:
+          type: string
+          nullable: true
+          description: 音频编码 mp4a/opus；none = 纯视频
+        height:
+          type: integer
+          nullable: true
+          description: 视频高度像素（画质主排序键）
+        fps:
+          type: number
+          nullable: true
+        tbr:
+          type: number
+          nullable: true
+          description: 总码率 kbps（画质次排序键）
+        filesize:
+          type: integer
+          nullable: true
+        filesize_approx:
+          type: integer
+          nullable: true
+        note:
+          type: string
+          nullable: true
+          description: 人类可读描述（如 "1080p - video only"）
+        needs_merge:
+          type: boolean
+          description: 选择是否需要音视频合并（分轨时 true，依赖 ffmpeg，规格 §8.4）
