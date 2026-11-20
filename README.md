@@ -1,44 +1,86 @@
-# StreamFlow iOS
+StreamFlow-iOS
 
-StreamFlow 的 iPhone 原生客户端：连接自架 NAS 上的 StreamFlow 服务端，浏览媒体库、
-发起 HTTP/magnet/torrent 下载任务、本地播放（直读或 HLS），并通过 DLNA/UPnP 投屏到
-局域网电视。
+ StreamFlow是一款面向个人 NAS 用户的 iPhone 客户端，提供下载任务管理、媒体浏览与播放、DLNA 投屏及 SMB 文件管理功能。
 
-- 服务端（NAS 侧，本仓库不含）：FastAPI 实现，见项目文档中的 OpenAPI 契约
-  （`docs/22-OpenAPI-v1-草案.yaml`）。
-- 本仓库为客户端单仓：SwiftUI App + XcodeGen 工程描述。
+连接自己的 NAS 服务端，即可通过 iPhone 管理下载任务、访问媒体文件，并在手机或电视上享受影音内容。
 
-## 构建
+功能特性
+
+下载任务管理
+- 创建下载任务
+- 暂停、继续和取消任务
+- 删除任务
+- 查看下载进度及错误信息
+
+媒体管理与播放
+- 浏览 NAS 媒体库
+- 在线播放媒体文件
+- 支持 HTTP / HLS 播放
+
+DLNA 投屏
+- 搜索局域网内的 DLNA 播放设备
+- 支持手动输入设备 IP 或扫描网段
+- 将媒体投放到电视等兼容设备
+- 支持播放、暂停、停止及进度查看
+
+SMB 文件管理
+- 配置 SMB 共享
+- 浏览共享目录
+- 备份媒体文件
+- 备份任务由 NAS 服务端执行
+
+技术架构
+
+- iOS 原生客户端
+- 通过 HTTP API 与 NAS 服务端通信
+- 服务端与客户端独立部署
+- 登录凭据通过 iOS Keychain 安全保存
+
+服务端不包含在本仓库中。
+
+API 接口定义：[`docs/openapi.yaml`](docs/openapi.yaml)
+
+环境要求
+
+- iOS 17 或更新版本
+- Xcode 15 或更新版本
+- [XcodeGen](https://github.com/yonaskolb/XcodeGen)
+
+构建与运行
+
+安装 XcodeGen：
+
+```bash
+brew install xcodegen
+```
+
+生成 Xcode 项目：
 
 ```bash
 cd ios
-brew install xcodegen
 xcodegen generate
-xcodebuild -project StreamFlow.xcodeproj -scheme StreamFlow \
-  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 ```
 
-要求：Xcode 16+、iOS 17.0+ 部署目标。
-
-## 本地自测（不依赖真实 NAS）
-
-仓库提供两个测试夹具（来自服务端仓库的 scripts/）：
+打开项目：
 
 ```bash
-# 源站文件服务器（确定性字节 + Range）
-python3 server/scripts/dev_source_server.py            # 127.0.0.1:8090
-# DLNA 模拟电视（SSDP 1900 + AVTransport 8091）
-python3 server/scripts/dev_dlna_mock.py --port 8091
+open StreamFlow.xcodeproj
 ```
 
-完整集成测试套件（连接/下载/播放/HLS/DLNA 投屏）运行在服务端仓库的 CI 中，
-需要真实 FastAPI 服务端，故不随本仓库分发。
+项目默认不配置代码签名。安装到真机时，需要在 Xcode 中配置自己的 Apple Developer Team。
 
-## 契约
+网络与设备发现
 
-客户端与服务端通过 `docs/22-OpenAPI-v1-草案.yaml` 描述的 HTTP API 通信；
-播放地址由服务端 HMAC 签名（零请求头可播，支持 Range 206）。
+DLNA 设备发现目前支持单播搜索、手动输入电视 IP 和网段扫描。
 
-## License
+多播设备发现需要 Apple Multicast Networking Entitlement，当前版本未启用该功能。
 
-Apache-2.0，见 [LICENSE](LICENSE)。
+使用 DLNA 投屏时，请确保 iPhone 与电视连接到同一局域网，并允许应用访问本地网络。
+反馈与贡献
+
+欢迎通过 GitHub Issues 提交问题、反馈使用体验或提出功能建议。
+
+Pull Request 将根据项目维护安排进行审核与合并。
+许可证
+
+本项目采用 [Apache License 2.0](LICENSE) 开源许可证。
