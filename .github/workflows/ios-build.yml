@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read  # GITHUB_TOKEN 只读
 
+# 并发去重：同一分支快速连推时取消旧 run，避免重复构建消耗
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-15
