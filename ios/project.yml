@@ -24,12 +24,18 @@ targets:
     info:
       path: Support/Info.plist
       properties:
+        # xcodegen 按 properties 重新生成 Info.plist，真机必需键必须写在这里
+        #（与私有版一致；2026-11-20 实测缺失 NSLocalNetworkUsageDescription
+        # 会使真机局域网访问被 iOS 拦截）
         UILaunchScreen: {}
+        CFBundleDisplayName: 游历Juli
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        NSLocalNetworkUsageDescription: 用于发现局域网内的 DLNA 投屏设备（电视等），并直连局域网 SMB 服务器与 NAS。不访问其他本地数据。
         # SMB 下载到本机：Documents 在「文件」App 可见（与私有版一致）
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        # 侧载后需连局域网 NAS（http://IP:8180）；IP 直连本身不受 ATS 限制，
-        # 此项兜底覆盖主机名形态
+        # 侧载后需连局域网 NAS；IP 直连本身不受 ATS 限制，此项兜底覆盖主机名形态
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
 schemes:
