@@ -160,8 +160,8 @@ def ssdp_responder(allow_multicast: bool = True):
         text = data.decode("utf-8", "replace")
         if not text.startswith("M-SEARCH"):
             continue
-        st = next((l.split(":", 1)[1].strip() for l in text.split("\r\n")
-                   if l.upper().startswith("ST:")), "")
+        st = next((line.split(":", 1)[1].strip() for line in text.split("\r\n")
+                   if line.upper().startswith("ST:")), "")
         if st not in ("urn:schemas-upnp-org:service:AVTransport:1",
                       "urn:schemas-upnp-org:device:MediaRenderer:1", "ssdp:all"):
             continue

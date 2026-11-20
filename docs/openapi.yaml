@@ -715,6 +715,246 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /smb/test:
+    post:
+      tags: [smb]
+      summary: SMB 连接测试（含真实写探针）
+      description: |
+        会话 + 共享树连接后，做真实「建+删探针目录」写探针（.sf-write-probe，
+        FILE_CREATE 语义，存在即碰撞拒绝，绝不覆盖既有内容；探针目录用后即删）。
+        探针失败即判不可用：备份是写场景，仅连接成功不足以证明可写。
+        连接参数优先取请求体 smb 对象，缺省回落服务端 env；凭据临时使用不落盘，
+        日志统一脱敏（password 等键值对打码）。
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                smb:
+                  $ref: "#/components/schemas/SmbConnectParams"
+      responses:
+        "200":
+          description: 连接与共享可写
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+        "400":
+          description: invalid_request / smb_not_configured（host/share 未配置）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "502":
+          description: smb_connect_failed（连接/认证/写探针失败）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /smb/ls:
+    post:
+      tags: [smb]
+      summary: 列出 SMB 远端目录
+      description: |
+        列出 base_dir 相对目录内容（过滤 . 与 ..）。
+        远端目录不存在 → 404 smb_dir_not_found；连接参数来源同 /smb/test。
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                smb:
+                  $ref: "#/components/schemas/SmbConnectParams"
+                remote_dir:
+                  type: string
+                  description: 相对目录（叠加 base_dir）；空串表示 base 根
+      responses:
+        "200":
+          description: 目录条目（客户端按 is_dir 分组展示）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [remote_dir, dirs, files]
+                properties:
+                  remote_dir:
+                    type: string
+                  dirs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SmbRemoteEntry"
+                  files:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SmbRemoteEntry"
+        "400":
+          description: invalid_request / smb_not_configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: smb_dir_not_found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: smb_error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /media/{media_id}/smb:
+    post:
+      tags: [smb]
+      summary: 把媒体文件备份到 SMB 共享（SHA-256 读回校验）
+      description: |
+        复制白名单内媒体文件到 SMB 共享并端到端校验：本地 SHA-256 → 流式写入 →
+        读回远端比对（大小 + SHA-256），不符即 502 且不登记副本。
+        远端路径 = remote_dir / 媒体名（与白名单内 name 一致）。
+        连接参数来源：请求体 smb 对象（优先）> 服务端 env；两者皆无 → 503。
+      parameters:
+        - name: media_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                smb:
+                  $ref: "#/components/schemas/SmbConnectParams"
+                remote_dir:
+                  type: string
+                  description: 目标目录（相对 base_dir）；空串表示 base 根
+      responses:
+        "200":
+          description: 备份完成并已登记副本
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SmbCopy"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: media_not_found / file_not_found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: smb_error（含读回校验失败）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: smb_unavailable（未配置任何连接参数）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      tags: [smb]
+      summary: 列出该媒体的 SMB 副本记录
+      parameters:
+        - name: media_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 副本记录（按创建时间倒序）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [copies]
+                properties:
+                  copies:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SmbCopy"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: media_not_found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /media/{media_id}/smb/{copy_id}:
+    delete:
+      tags: [smb]
+      summary: 删除 SMB 副本（远端文件 + 登记记录）
+      description: |
+        删除远端文件并移除副本登记。副本登记不保存连接参数，
+        删除时按当前请求/配置重新解析连接（参数与备份时不同会找不到远端文件）。
+      parameters:
+        - name: media_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: copy_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                smb:
+                  $ref: "#/components/schemas/SmbConnectParams"
+      responses:
+        "200":
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, copy_id]
+                properties:
+                  status:
+                    type: string
+                  copy_id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: copy_not_found（或 media_id 不匹配）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: smb_error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -977,3 +1217,56 @@ components:
         needs_merge:
           type: boolean
           description: 选择是否需要音视频合并（分轨时 true，依赖 ffmpeg，规格 §8.4）
+    SmbConnectParams:
+      type: object
+      description: 请求级 SMB 连接参数（临时使用不落盘；缺省字段回落服务端 env）
+      properties:
+        host:
+          type: string
+        port:
+          type: integer
+          default: 445
+        share:
+          type: string
+        username:
+          type: string
+          description: 空串 = 匿名/来宾
+        password:
+          type: string
+          writeOnly: true
+          description: 仅用于本次连接；不在任何响应中回显，日志统一脱敏
+        base_dir:
+          type: string
+          description: 共享内基础目录（叠加在所有相对路径前）
+    SmbRemoteEntry:
+      type: object
+      required: [name, is_dir, size]
+      properties:
+        name:
+          type: string
+        is_dir:
+          type: boolean
+        size:
+          type: integer
+          format: int64
+    SmbCopy:
+      type: object
+      description: 媒体在 SMB 共享上的副本登记（登记不含连接参数）
+      properties:
+        copy_id:
+          type: string
+        media_id:
+          type: string
+        kind:
+          type: string
+          description: 副本类型，当前固定 smb
+        remote_path:
+          type: string
+        size_bytes:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+        created_at:
+          type: string
+          format: date-time

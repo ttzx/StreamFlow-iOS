@@ -8,6 +8,28 @@ struct MediaView: View {
     @State private var playing: MediaItem?
     @State private var casting: MediaItem?
     @State private var errorMessage: String?
+    @State private var renaming: MediaItem?
+    @State private var renameText = ""
+    @State private var moving: MediaItem?
+    @State private var confirmDelete: MediaItem?
+    @State private var smbMessage = ""
+    @State private var smbAlertShown = false
+    @State private var smbBrowsing: MediaItem?
+
+    private var renameBinding: Binding<Bool> {
+        Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+    }
+    private var deleteDialogBinding: Binding<Bool> {
+        Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } })
+    }
+    private var smbAlertBinding: Binding<Bool> {
+        Binding(get: { smbAlertShown }, set: { smbAlertShown = $0 })
+    }
+    private var smbTitle: String {
+        if smbMessage.hasPrefix("备份成功") { return "备份完成" }
+        if smbMessage.hasPrefix("请先") { return "SMB 未配置" }
+        return "备份失败"
+    }
 
     var body: some View {
         NavigationStack {
@@ -22,6 +44,17 @@ struct MediaView: View {
                     MediaRow(item: item,
                              onPlay: { Task { await play(item) } },
                              onCast: { casting = item })
+                        .contextMenu {
+                            Button { renaming = item; renameText = item.name } label: {
+                                Label("重命名", systemImage: "pencil") }
+                            Button { moving = item } label: {
+                                Label("移动/分类", systemImage: "folder") }
+                            Button { Task { await startSMBBackup(item) } } label: {
+                                Label("备份到 SMB", systemImage: "cloud.upload") }
+                            Divider()
+                            Button(role: .destructive) { confirmDelete = item } label: {
+                                Label("删除", systemImage: "trash") }
+                        }
                 }
             }
             .navigationTitle("媒体库")
@@ -36,6 +69,33 @@ struct MediaView: View {
             }
             .sheet(item: $casting) { media in
                 CastSheet(api: api, media: media)
+            }
+            .sheet(item: $moving) { media in
+                MoveSheet(api: api, media: media) { Task { await load() } }
+            }
+            .alert("重命名", isPresented: renameBinding, presenting: renaming) { item in
+                TextField("新名称", text: $renameText)
+                Button("确定") { Task { await doRename(item) } }
+                Button("取消", role: .cancel) {}
+            } message: { _ in Text("输入新的文件名（可省略扩展名）") }
+            .confirmationDialog("删除媒体", isPresented: deleteDialogBinding,
+                                titleVisibility: .visible, presenting: confirmDelete) { item in
+                Button("仅解除登记（保留文件）", role: .destructive) {
+                    Task { await doDelete(item, deleteFile: false) }
+                }
+                Button("删除文件（不可恢复）", role: .destructive) {
+                    Task { await doDelete(item, deleteFile: true) }
+                }
+                Button("取消", role: .cancel) {}
+            } message: { item in Text(item.name) }
+            .alert(smbTitle, isPresented: smbAlertBinding) {
+                Button("好", role: .cancel) {}
+            } message: { Text(smbMessage) }
+            .sheet(item: $smbBrowsing) { media in
+                // 备份目标经 SMB 直连浏览选择（不经 NAS；SMB 凭据只在本机使用）
+                SMBDirPickerSheet { target in
+                    Task { await backupNASMediaToSMB(media, dir: target) }
+                }
             }
         }
     }
@@ -62,6 +122,51 @@ struct MediaView: View {
             errorMessage = error.localizedDescription
         }
     }
+
+    // ---- 媒体管理（重命名/移动/删除/SMB 备份） ----
+
+    /// SMB 备份入口（NAS 媒体 → SMB）：SMB 目标直连浏览；凭据只在本机使用
+    private func startSMBBackup(_ item: MediaItem) async {
+        guard SMBConfig.shared.configured else {
+            smbMessage = "请先在「设置」页配置 SMB 服务器（独立于 NAS）"
+            smbAlertShown = true
+            return
+        }
+        smbBrowsing = item
+    }
+
+    /// NAS 媒体 → SMB 管道：需要 NAS 在线（数据来源）+ SMB 可达；
+    /// SMB 凭据不发给 NAS，NAS 故障不影响 SMB 独立功能
+    private func backupNASMediaToSMB(_ media: MediaItem, dir: String) async {
+        do {
+            let record = try await SMBMediaBackup.run(api: api, media: media, remoteDir: dir)
+            SMBBackupRegistry.shared.add(record)
+            smbMessage = "备份成功：\(record.remotePath)（\(ByteCountFormatter.string(fromByteCount: record.sizeBytes, countStyle: .binary))，SHA-256 校验一致）"
+            smbAlertShown = true
+            await load()
+        } catch {
+            smbMessage = "备份失败：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+            smbAlertShown = true
+        }
+    }
+
+    private func doRename(_ item: MediaItem) async {
+        let name = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        do {
+            _ = try await api.renameMedia(item, name: name)
+            await load()
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    private func doDelete(_ item: MediaItem, deleteFile: Bool) async {
+        do {
+            try await api.deleteMedia(item, deleteFile: deleteFile)
+            await load()
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    // NAS 媒体 → SMB 备份已改为手机端管道（SMBMediaBackup），SMB 凭据不出本机
 }
 
 private struct MediaRow: View {
@@ -268,3 +373,81 @@ struct DLNADeviceHTTPClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 }
+
+/// 移动/分类 sheet：选择现有目录或新建目录（目录即分类）
+struct MoveSheet: View {
+    let api: APIClient
+    let media: MediaItem
+    var onDone: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var dirs: [String] = []
+    @State private var selected: String?
+    @State private var newDir = ""
+    @State private var error: String?
+    @State private var moving = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("目标目录") {
+                    Button { selected = "" } label: {
+                        HStack {
+                            Text("根目录（不分类）").foregroundColor(.primary)
+                            if selected == "" { Spacer(); Image(systemName: "checkmark").foregroundColor(.blue) }
+                        }
+                    }
+                    ForEach(dirs, id: \.self) { d in
+                        Button { selected = d } label: {
+                            HStack {
+                                Text(d).foregroundColor(.primary)
+                                if selected == d { Spacer(); Image(systemName: "checkmark").foregroundColor(.blue) }
+                            }
+                        }
+                    }
+                    if let s = selected {
+                        Text("将移动到：\(s.isEmpty ? "根目录" : s)")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                }
+                Section("新建目录（可含子路径，如 电影/2026）") {
+                    TextField("目录名", text: $newDir)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Button("创建目录") { Task { await createDir() } }
+                }
+                Section {
+                    Button("移动") { Task { await move() } }.disabled(moving)
+                    if moving { ProgressView() }
+                    if let e = error { Text(e).foregroundColor(.red).font(.caption) }
+                }
+            }
+            .navigationTitle("移动/分类")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } } }
+            .task { await loadDirs() }
+        }
+    }
+
+    private func loadDirs() async {
+        dirs = (try? await api.listDirs()) ?? []
+    }
+
+    private func createDir() async {
+        let p = newDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !p.isEmpty else { return }
+        do { try await api.createDir(p); dirs.append(p); newDir = "" } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func move() async {
+        moving = true; error = nil
+        do {
+            _ = try await api.moveMedia(media, dir: selected ?? "")
+            onDone()
+            dismiss()
+        } catch { self.error = error.localizedDescription }
+        moving = false
+    }
+}
+

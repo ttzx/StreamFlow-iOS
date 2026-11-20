@@ -11,11 +11,11 @@ import Foundation
 /// - 没有 DispatchGroup enter/leave 失衡问题；socket 在 defer 中必然关闭（旧版连接从不 cancel）。
 /// - 无可变共享状态，类型 Sendable（并发隔离 R-13 口径一致）。
 /// - 组播与单播 M-SEARCH 双路径（UPnP 1.1 均合法）：组播为标准发现；单播用于
-///   「手动输入电视 IP」回退路径（r5 冻结令预案），且不触发 iOS 多播 entitlement。
+///   「手动输入电视 IP」回退路径（r5 预留方案），且不触发 iOS 多播 entitlement。
 /// - ⚠️ 真机限制（Apple 官方文档 com.apple.developer.networking.multicast）：
 ///   iOS 上 app **发送或接收**任何 IP 多播/广播都必须持有 multicast entitlement，
 ///   且需向 Apple 申请审批。模拟器不受此限制（走 macOS 网络栈）；
-///   真机多播发现为待决事项（docs/00 待决清单），单播路径不受影响。
+///   真机多播发现为待决事项，单播路径不受影响。
 public final class SSDPDiscovery: Sendable {
     public struct Response: Codable, Sendable, Hashable {
         public let location: String     // 设备描述 XML 地址
