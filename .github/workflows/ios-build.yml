@@ -52,6 +52,12 @@ jobs:
           APPNAME=$(basename "$APP")
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
+          # 版本号用 CI Run ID 递增：侧载工具对「同 bundle id 同版本」的更新安装
+          # 处理不可靠（实测 3639c83 可装、同结构 213a52d 失败），递增 build number
+          # 让其走标准更新路径
+          PLIST="Payload/$APPNAME/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_ID}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.0" "$PLIST"
           zip -qry StreamFlow-unsigned.ipa Payload
           echo "== 产物自检 =="
           EXEC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "Payload/$APPNAME/Info.plist")
