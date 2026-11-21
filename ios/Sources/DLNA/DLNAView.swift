@@ -15,6 +15,8 @@ struct DLNAView: View {
     @State private var mediaItems: [MediaItem] = []
     @State private var mediaLoading = false
     @State private var mediaError: String?
+    @State private var showManualIP = false
+    @State private var manualIP = ""
 
     var body: some View {
         NavigationStack {
@@ -25,14 +27,33 @@ struct DLNAView: View {
             .navigationTitle("DLNA")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { discovery.start() } label: {
-                        Label("重新搜索", systemImage: "antenna.radiowaves.left.and.right")
+                    Menu {
+                        Button { discovery.start() } label: {
+                            Label("组播搜索", systemImage: "antenna.radiowaves.left.and.right")
+                        }
+                        Button { discovery.scanSubnet() } label: {
+                            Label("扫描网段（真机推荐）", systemImage: "dot.radiowaves.left.and.right")
+                        }
+                        Button { showManualIP = true } label: {
+                            Label("手动输入电视 IP", systemImage: "number")
+                        }
+                    } label: {
+                        Label("搜索", systemImage: "magnifyingglass")
                     }
                 }
             }
             .onAppear { if discovery.devices.isEmpty && !discovery.searching { discovery.start() } }
             .onDisappear { discovery.stop(); poller?.cancel() }
             .sheet(isPresented: $showMediaPicker) { mediaPicker }
+            .alert("手动输入电视 IP", isPresented: $showManualIP) {
+                TextField("如 192.168.x.x", text: $manualIP)
+                    .keyboardType(.decimalPad)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                Button("探测") { discovery.probe(host: manualIP) }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("向该地址发单播 M-SEARCH（无需多播权限）")
+            }
         }
     }
 
@@ -41,9 +62,17 @@ struct DLNAView: View {
     private var deviceSection: some View {
         Section("局域网设备") {
             if discovery.devices.isEmpty {
-                Text(discovery.searching ? "正在搜索…"
-                     : "未发现设备。确认电视与手机同一局域网后点「重新搜索」。")
-                    .foregroundColor(.secondary)
+                if discovery.searching {
+                    Text(discovery.scanStatus ?? "正在搜索…").foregroundColor(.secondary)
+                    ProgressView()
+                } else {
+                    Text("未发现设备。真机上组播需要 Apple 多播权限，请改用\n「搜索 → 扫描网段」或「手动输入电视 IP」。")
+                        .foregroundColor(.secondary)
+                        .font(.caption)
+                }
+            }
+            if let s = discovery.scanStatus, !discovery.devices.isEmpty {
+                Text(s).font(.caption).foregroundColor(.secondary)
             }
             ForEach(discovery.devices) { d in
                 Button {

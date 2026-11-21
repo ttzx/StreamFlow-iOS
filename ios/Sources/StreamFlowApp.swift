@@ -65,7 +65,7 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                     TextField("端口（默认 445）", text: $smbCfg.portText)
                         .keyboardType(.numberPad)
-                    TextField("共享名", text: $smbCfg.share)
+                    TextField("共享名（可选；留空进 SMB 页自动枚举）", text: $smbCfg.share)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                     TextField("用户名（可留空）", text: $smbCfg.username)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -110,17 +110,23 @@ struct SettingsView: View {
         testing = false
     }
 
-    /// SMB 直连测试：直接用当前表单数据，不经 NAS（三功能独立）
+    /// SMB 登录测试（账户认证与共享选择分离：此处只测登录；
+    /// 共享名留空 = 进 SMB 页自动枚举，选定时再做共享级测试）
     private func testSMB() async {
-        guard !smbCfg.host.isEmpty, !smbCfg.share.isEmpty else {
-            smbTestResult = "请先填写 SMB 服务器地址与共享名"
+        guard !smbCfg.host.isEmpty else {
+            smbTestResult = "请先填写 SMB 服务器地址"
             return
         }
         smbTesting = true
         smbTestResult = nil
         do {
-            try await SMBService.shared.testConnection()
-            smbTestResult = "SMB 连接成功（\(smbCfg.summary)）"
+            try await SMBService.shared.testLogin()
+            if smbCfg.share.isEmpty {
+                smbTestResult = "SMB 登录成功（\(smbCfg.host):\(smbCfg.portNumber)，未选共享）"
+            } else {
+                try await SMBService.shared.testConnection()
+                smbTestResult = "SMB 连接成功（\(smbCfg.summary)）"
+            }
         } catch {
             smbTestResult = "SMB 连接失败：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
         }

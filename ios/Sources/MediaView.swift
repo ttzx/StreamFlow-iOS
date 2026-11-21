@@ -225,6 +225,8 @@ struct CastSheet: View {
     @State private var position: AVTransport.Position?
     @State private var poller: Task<Void, Never>?
     @State private var error: String?
+    @State private var showManualIP = false
+    @State private var manualIP = ""
 
     var body: some View {
         NavigationStack {
@@ -258,8 +260,13 @@ struct CastSheet: View {
                 }
                 Section("局域网设备") {
                     if discovery.devices.isEmpty {
-                        Text(discovery.searching ? "正在搜索…" : "未发现设备。点击下方按钮重新搜索。")
-                            .foregroundColor(.secondary)
+                        if discovery.searching {
+                            Text(discovery.scanStatus ?? "正在搜索…").foregroundColor(.secondary)
+                            ProgressView()
+                        } else {
+                            Text("未发现设备。用「扫描网段」或「手动输入 IP」查找电视（真机组播需 Apple 权限）。")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
                     }
                     ForEach(discovery.devices) { device in
                         Button {
@@ -273,7 +280,13 @@ struct CastSheet: View {
                             }
                         }
                     }
-                    Button("重新搜索") { discovery.start() }
+                    HStack {
+                        Button("组播搜索") { discovery.start() }
+                        Spacer()
+                        Button("扫描网段") { discovery.scanSubnet() }
+                        Spacer()
+                        Button("手动输入 IP") { showManualIP = true }
+                    }
                 }
             }
             .navigationTitle("投屏")
@@ -283,8 +296,17 @@ struct CastSheet: View {
                     Button("关闭") { discovery.stop(); poller?.cancel(); dismiss() }
                 }
             }
-            .onAppear { discovery.start() }
+            .onAppear { if discovery.devices.isEmpty && !discovery.searching { discovery.start() } }
             .onDisappear { discovery.stop(); poller?.cancel() }
+            .alert("手动输入电视 IP", isPresented: $showManualIP) {
+                TextField("如 192.168.x.x", text: $manualIP)
+                    .keyboardType(.decimalPad)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                Button("探测") { discovery.probe(host: manualIP) }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("向该地址发单播 M-SEARCH（无需多播权限）")
+            }
         }
     }
 

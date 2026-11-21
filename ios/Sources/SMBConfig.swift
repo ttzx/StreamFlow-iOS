@@ -35,11 +35,14 @@ final class SMBConfig: ObservableObject {
     /// 最近一次 Keychain 写入是否失败（UI 据此在保存结果中如实报错）
     @Published var keychainWriteFailed = false
 
-    var configured: Bool { !host.isEmpty && !share.isEmpty }
+    /// 只要求主机地址；共享名可选：账户认证与共享选择分离，
+    /// 登录后可自动枚举共享）。未选共享时进入 SMB 页会先出现共享选择列表。
+    var configured: Bool { !host.isEmpty }
+    var shareSelected: Bool { !share.isEmpty }
     var portNumber: Int { Int(portText.trimmingCharacters(in: .whitespaces)) ?? 445 }
 
     var summary: String {
-        "\(host):\(portNumber)/\(share)\(username.isEmpty ? "（匿名）" : " · \(username)")"
+        "\(host):\(portNumber)/\(share.isEmpty ? "未选共享" : share)\(username.isEmpty ? "（匿名）" : " · \(username)")"
     }
 
     private init() {
@@ -54,18 +57,14 @@ final class SMBConfig: ObservableObject {
 
     /// 保存当前表单（显式入口；返回给 UI 的确认文案，失败时如实报错）
     func save() -> String {
-        if host.isEmpty && share.isEmpty {
-            username = ""
-            baseDir = ""
-            password = ""
-            return "已清除 SMB 配置"
-        }
-        guard !host.isEmpty, !share.isEmpty else {
-            return "保存失败：SMB 地址与共享名需同时填写"
+        guard !host.isEmpty else {
+            return "保存失败：请填写 SMB 服务器地址"
         }
         if keychainWriteFailed {
             return "保存失败：Keychain 写入失败（OSStatus 见日志），密码未持久化"
         }
-        return "已保存（密码已存本机 Keychain）"
+        return share.isEmpty
+            ? "已保存（未选共享：进入 SMB 页自动枚举选择）"
+            : "已保存（密码已存本机 Keychain）"
     }
 }

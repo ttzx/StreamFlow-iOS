@@ -17,12 +17,17 @@ struct SMBView: View {
     @State private var creatingDir = false
     @State private var newDirName = ""
     @State private var detailFile: SMBEntry?
+    @State private var shares: [SMBShareInfo] = []
+    @State private var sharesLoading = false
+    @State private var manualShare = ""
 
     var body: some View {
         NavigationStack {
             Group {
                 if !config.configured {
                     unconfigured
+                } else if !config.shareSelected {
+                    sharePicker
                 } else {
                     browser
                 }
@@ -35,8 +40,67 @@ struct SMBView: View {
         ContentUnavailableView {
             Label("SMB 未配置", systemImage: "externaldrive.badge.wifi")
         } description: {
-            Text("在「设置」页填写 SMB 服务器地址、端口、共享名与凭据。\nSMB 与 NAS 互不依赖：无需 NAS 在线，凭据只保存在本机。")
+            Text("在「设置」页填写 SMB 服务器地址、端口与凭据（共享名可选）。\nSMB 与 NAS 互不依赖：无需 NAS 在线，凭据只保存在本机。")
         }
+    }
+
+    // MARK: - 共享选择（登录后枚举；账户认证与共享选择分离）
+
+    private var sharePicker: some View {
+        List {
+            Section("选择共享（\(config.host):\(config.portNumber)）") {
+                if sharesLoading { ProgressView() }
+                if let e = error { Text(e).foregroundColor(.red).font(.caption) }
+                ForEach(shares) { s in
+                    Button {
+                        config.share = s.name
+                        path = ""
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text(s.name).foregroundColor(.primary)
+                                if !s.comment.isEmpty {
+                                    Text(s.comment).font(.caption).foregroundColor(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Image(systemName: "externaldrive").foregroundColor(.blue)
+                        }
+                    }
+                }
+                if !sharesLoading && shares.isEmpty && error == nil {
+                    Text("未枚举到共享（服务器可能禁用共享列表）。可在下方手动输入共享名。")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+            Section("手动输入共享名") {
+                TextField("共享名", text: $manualShare)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                Button("使用该共享") {
+                    let name = manualShare.trimmingCharacters(in: .whitespaces)
+                    guard !name.isEmpty else { return }
+                    config.share = name
+                    path = ""
+                }
+            }
+            Section {
+                Button("重新枚举") { Task { await loadShares() } }
+            }
+        }
+        .navigationTitle("选择共享")
+        .task { await loadShares() }
+    }
+
+    private func loadShares() async {
+        sharesLoading = true
+        error = nil
+        do {
+            shares = try await SMBService.shared.listShares()
+        } catch {
+            shares = []
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+        sharesLoading = false
     }
 
     private var browser: some View {
@@ -193,6 +257,7 @@ private struct SMBFileDetailSheet: View {
     @State private var busy = false
     @State private var message: String?
     @State private var error: String?
+    @State private var showCast = false
 
     var body: some View {
         NavigationStack {
@@ -207,6 +272,12 @@ private struct SMBFileDetailSheet: View {
                         Task { await download() }
                     } label: { Label("下载到本机（文件 App 可见）", systemImage: "square.and.arrow.down") }
                         .disabled(busy)
+                    if SMBVideoMime.isVideo(entry.name) {
+                        Button {
+                            showCast = true
+                        } label: { Label("投屏到电视（本机中继）", systemImage: "play.tv") }
+                            .disabled(busy)
+                    }
                     if busy { ProgressView() }
                     if let m = message { Text(m).font(.caption).foregroundColor(.green) }
                     if let e = error { Text(e).foregroundColor(.red).font(.caption) }
@@ -215,6 +286,9 @@ private struct SMBFileDetailSheet: View {
             .navigationTitle("SMB 文件")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } } }
+            .sheet(isPresented: $showCast) {
+                SMBCastSheet(remotePath: path, name: entry.name, size: entry.size)
+            }
         }
     }
 
@@ -376,5 +450,174 @@ enum SMBMediaBackup {
         let rel = remoteDir.isEmpty ? safeName : remoteDir + "/" + safeName
         return try await SMBService.shared.uploadVerified(
             localURL: local, remoteRel: rel, note: "NAS 媒体备份")
+    }
+}
+
+/// SMB 文件投屏：本机 HTTP 中继 + DLNA 渲染器（电视经局域网拉取手机中继流）。
+/// 与媒体页 CastSheet 同一状态机口径；设备发现带网段扫描/手动 IP（真机无多播权限也可用）。
+struct SMBCastSheet: View {
+    let remotePath: String
+    let name: String
+    let size: UInt64
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var discovery = DLNADiscoveryModel()
+    @State private var controller = CastController()
+    @State private var castState: CastController.CastState = .idle
+    @State private var position: AVTransport.Position?
+    @State private var poller: Task<Void, Never>?
+    @State private var error: String?
+    @State private var preparing = false
+    @State private var showManualIP = false
+    @State private var manualIP = ""
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("文件") {
+                    Text(name).lineLimit(1)
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .binary))
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                Section("状态") {
+                    Text(stateText(castState)).font(.headline)
+                    if preparing { ProgressView() }
+                    if let p = position {
+                        Text("进度 \(p.trackSeconds)s / \(p.durationSeconds)s")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    if let e = error { Text(e).foregroundColor(.red).font(.caption) }
+                }
+                if isControllable {
+                    Section("控制") {
+                        Button("暂停") { Task {
+                            if let st = await run({ try await controller.pause() }) { castState = st }
+                        } }
+                        Button("继续播放") { Task {
+                            if let st = await run({ try await controller.resume() }) {
+                                castState = st
+                                if st == .confirmedPlaying { startPolling() }
+                            }
+                        } }
+                        Button("停止", role: .destructive) { Task {
+                            if let st = await run({ try await controller.stop() }) {
+                                castState = st
+                                if st == .stopped { poller?.cancel(); position = nil }
+                            }
+                        } }
+                    }
+                }
+                Section("局域网设备") {
+                    if discovery.devices.isEmpty {
+                        if discovery.searching {
+                            Text(discovery.scanStatus ?? "正在搜索…").foregroundColor(.secondary)
+                            ProgressView()
+                        } else {
+                            Text("未发现设备。用「扫描网段」或「手动输入 IP」查找电视。")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                    ForEach(discovery.devices) { d in
+                        Button {
+                            Task { await cast(to: d) }
+                        } label: {
+                            VStack(alignment: .leading) {
+                                Text(d.friendlyName).foregroundColor(.primary)
+                                Text(d.manufacturer.isEmpty ? d.modelName
+                                     : "\(d.manufacturer) · \(d.modelName)")
+                                    .font(.caption).foregroundColor(.secondary)
+                            }
+                        }
+                        .disabled(preparing)
+                    }
+                    HStack {
+                        Button("扫描网段") { discovery.scanSubnet() }
+                        Spacer()
+                        Button("手动输入 IP") { showManualIP = true }
+                    }
+                }
+            }
+            .navigationTitle("SMB 投屏")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { discovery.stop(); poller?.cancel(); dismiss() }
+                }
+            }
+            .onAppear { if discovery.devices.isEmpty && !discovery.searching { discovery.scanSubnet() } }
+            .onDisappear { discovery.stop(); poller?.cancel() }
+            .alert("手动输入电视 IP", isPresented: $showManualIP) {
+                TextField("如 192.168.x.x", text: $manualIP)
+                    .keyboardType(.decimalPad)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                Button("探测") { discovery.probe(host: manualIP) }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("向该地址发单播 M-SEARCH（无需多播权限）")
+            }
+        }
+    }
+
+    private var isControllable: Bool {
+        switch castState {
+        case .confirmedPlaying, .paused, .uriSent: return true
+        default: return false
+        }
+    }
+
+    /// 启动本机中继 → 生成中继 URL → DLNA 投放
+    private func cast(to device: DLNADevice) async {
+        error = nil
+        position = nil
+        preparing = true
+        castState = .connecting
+        do {
+            _ = try await CastRelayServer.shared.start()
+            let mime = SMBVideoMime.forPath(name)
+            let rel = CastRelayServer.shared.register(path: remotePath, size: size, mime: mime)
+            guard let url = CastRelayServer.shared.url(for: rel) else {
+                throw SMBServiceError.other("未获取到本机局域网 IP（请确认 Wi-Fi 已连接）")
+            }
+            let item = CastController.CastMedia(url: url, title: name, mimeType: mime)
+            castState = try await controller.cast(item: item, device: device, httpClient: client())
+            if castState == .confirmedPlaying { startPolling() }
+        } catch {
+            castState = .idle
+            self.error = error.localizedDescription
+        }
+        preparing = false
+    }
+
+    private func client() -> (String, String, String) async throws -> String {
+        let http = DLNADeviceHTTPClient()
+        return { url, action, body in try await http.post(url: url, soapAction: action, body: body) }
+    }
+
+    private func run(_ op: @escaping () async throws -> CastController.CastState)
+        async -> CastController.CastState? {
+        error = nil
+        do { return try await op() } catch { self.error = error.localizedDescription; return nil }
+    }
+
+    private func stateText(_ s: CastController.CastState) -> String {
+        switch s {
+        case .confirmedPlaying: return "电视已确认播放"
+        case .paused: return "已暂停"
+        case .stopped: return "已停止"
+        case .uriSent: return "指令已发送"
+        case .connecting: return "连接中…"
+        case .idle: return "未投屏"
+        case .error(let e): return "错误：\(e)"
+        }
+    }
+
+    private func startPolling() {
+        poller?.cancel()
+        let c = client()
+        poller = Task {
+            while !Task.isCancelled {
+                position = await controller.pollPosition(httpClient: c)
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
     }
 }
