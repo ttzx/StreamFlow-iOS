@@ -57,7 +57,7 @@ final class CastRelayServer: @unchecked Sendable {
         }
     }
 
-    /// 启动监听（幂等）；返回实际端口
+    /// 启动监听（幂等）；只绑 Wi-Fi 接口（不暴露蜂窝/其他通道），返回实际端口
     func start() async throws -> UInt16 {
         lock.lock()
         if port != 0 {
@@ -67,7 +67,9 @@ final class CastRelayServer: @unchecked Sendable {
         }
         lock.unlock()
 
-        let listener = try NWListener(using: NWParameters.tcp, on: .any)
+        let params = NWParameters.tcp
+        params.requiredInterfaceType = .wifi   // 只服务局域网渲染器，不经蜂窝暴露
+        let listener = try NWListener(using: params, on: .any)
         let done = DispatchSemaphore(value: 0)
         var started = false
         listener.stateUpdateHandler = { [weak self] state in
@@ -98,13 +100,28 @@ final class CastRelayServer: @unchecked Sendable {
         return p
     }
 
-    /// 登记要投的 SMB 文件；返回相对 URL 路径 /media/<token>
+    /// 登记要投的 SMB 文件；返回相对 URL 路径 /media/<token>。
+    /// 单文件策略：新登记即作废既有会话（同时只服务一个文件）；token 为
+    /// UUIDv4（122 位随机，Apple 平台 CSPRNG），不可枚举。
     func register(path: String, size: UInt64, mime: String) -> String {
         let token = UUID().uuidString
         lock.lock()
+        sessions.removeAll()
         sessions[token] = Session(path: path, size: size, mime: mime)
         lock.unlock()
         return "/media/\(token)"
+    }
+
+    /// 停止中继：清空全部会话并关闭监听（投屏结束/页面关闭时调用；
+    /// App 退出由进程销毁兜底）。
+    func stop() {
+        lock.lock()
+        sessions.removeAll()
+        let l = listener
+        listener = nil
+        port = 0
+        lock.unlock()
+        l?.cancel()
     }
 
     /// 拼投屏 URL（手机当前局域网 IP）

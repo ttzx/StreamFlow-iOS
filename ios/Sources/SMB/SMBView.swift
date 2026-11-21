@@ -501,7 +501,11 @@ struct SMBCastSheet: View {
                         Button("停止", role: .destructive) { Task {
                             if let st = await run({ try await controller.stop() }) {
                                 castState = st
-                                if st == .stopped { poller?.cancel(); position = nil }
+                                if st == .stopped {
+                                    poller?.cancel()
+                                    position = nil
+                                    CastRelayServer.shared.stop()  // 停止即关中继
+                                }
                             }
                         } }
                     }
@@ -544,7 +548,11 @@ struct SMBCastSheet: View {
                 }
             }
             .onAppear { if discovery.devices.isEmpty && !discovery.searching { discovery.scanSubnet() } }
-            .onDisappear { discovery.stop(); poller?.cancel() }
+            .onDisappear {
+                discovery.stop()
+                poller?.cancel()
+                CastRelayServer.shared.stop()   // 投屏结束即关中继（App 退出另有兜底）
+            }
             .alert("手动输入电视 IP", isPresented: $showManualIP) {
                 TextField("如 192.168.x.x", text: $manualIP)
                     .keyboardType(.decimalPad)

@@ -326,10 +326,13 @@ actor SMBService {
             localSize += UInt64(chunk.count)
         }
         let localSha = localHasher.finalize().finalizedHex
-        // 2) 上传（流式；恢复重试会整段重来，目标为覆盖写，幂等）
+        // 2) 上传（覆盖写）：库的 FileWriter 是 createDisposition=.create——目标已存在
+        //    即碰撞失败，断线重试/重复备份同名文件会挂；这里直接用会话原语
+        //    overwriteIf（存在即截断重建），从 0 重写。恢复重试重跑本函数即
+        //    「从头覆盖，不在半截文件上续写」；上传后另有 SHA-256 读回校验兜底。
         try await withRecovery { c in
             try await withTimeout(1800) {
-                try await c.upload(localPath: localURL, remotePath: remote)
+                try await Self.uploadOverwrite(client: c, localURL: localURL, remote: remote)
             }
         }
         // 3) 读回校验：证明 SMB 服务端真正落盘的字节与本地一致
@@ -412,6 +415,38 @@ actor SMBService {
         return RelayReader(
             readFn: { @Sendable offset, length in try await r.read(offset: offset, length: length) },
             closeFn: { @Sendable in try? await r.close() })
+    }
+
+    /// 覆盖写上传：overwriteIf（存在即截断重建）→ 从 0 按会话 maxWriteSize 分块写。
+    /// 与库 FileWriter 的差异仅在 createDisposition（.create 改 .overwriteIf），
+    /// 路径规范化（去首尾斜杠 + / 转 \）与 Pathname.normalize 保持一致。
+    private static func uploadOverwrite(client: SMBClient,
+                                        localURL: URL, remote: String) async throws {
+        let session = client.session
+        let file = try FileHandle(forReadingFrom: localURL)
+        defer { try? file.close() }
+        let normalized = remote
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/\\"))
+            .replacingOccurrences(of: "/", with: "\\")
+        let create = try await session.create(
+            desiredAccess: [.readData, .writeData, .appendData, .readAttributes,
+                            .readControl, .writeDac],
+            fileAttributes: [.archive, .normal],
+            shareAccess: [.read, .write, .delete],
+            createDisposition: .overwriteIf,
+            createOptions: [],
+            name: normalized)
+        do {
+            var offset: UInt64 = 0
+            while let chunk = try file.read(upToCount: Int(session.maxWriteSize)), !chunk.isEmpty {
+                _ = try await session.write(data: chunk, fileId: create.fileId, offset: offset)
+                offset += UInt64(chunk.count)
+            }
+            try await session.close(fileId: create.fileId)
+        } catch {
+            try? await session.close(fileId: create.fileId)
+            throw error
+        }
     }
 }
 
