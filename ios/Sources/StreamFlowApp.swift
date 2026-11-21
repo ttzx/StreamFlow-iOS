@@ -93,6 +93,8 @@ struct SettingsView: View {
                         .font(.caption).foregroundColor(.secondary)
                 }
             }
+            .scrollDismissesKeyboardImmediately()
+            .keyboardDoneBar()
             .navigationTitle("设置")
         }
     }

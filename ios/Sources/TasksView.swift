@@ -146,9 +146,14 @@ private struct CreateTaskSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("链接 / 磁力") {
-                    TextField("https://… 或 magnet:?xt=…", text: $input, axis: .vertical)
-                        .lineLimit(3)
+                Section("链接 / 磁力（支持整段分享文字、b23.tv 短链、BV 号）") {
+                    TextField("粘贴分享文字或 https://… / magnet:?xt=…", text: $input, axis: .vertical)
+                        .lineLimit(4)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    if let hint = recognizeHint {
+                        Text(hint).font(.caption).foregroundColor(.secondary)
+                    }
                 }
                 Section("保存到（相对媒体根目录，可空）") {
                     TextField("movie/", text: $savePath)
@@ -157,6 +162,8 @@ private struct CreateTaskSheet: View {
                     Text(e).foregroundColor(.red)
                 }
             }
+            .scrollDismissesKeyboardImmediately()
+            .keyboardDoneBar()
             .navigationTitle("新建下载")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -169,16 +176,37 @@ private struct CreateTaskSheet: View {
         }
     }
 
+    /// 输入识别预览（LiuZhuan 基线：整段分享文字 → URL + 标题）
+    private var recognizeHint: String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.lowercased().hasPrefix("magnet:?") else { return nil }
+        let parsed = ShareParser.parse(trimmed)
+        guard let url = parsed.urls.first else {
+            return "未识别到链接（可整段粘贴分享文字，或单独输入 BV 号）"
+        }
+        return parsed.title == "StreamFlow"
+            ? "识别到：\(url)"
+            : "识别到：\(url)\n标题：\(parsed.title)"
+    }
+
     private func create() async {
         busy = true
         defer { busy = false }
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.lowercased().hasPrefix("magnet:?") {
                 _ = try await api.createMagnet(magnet: trimmed, savePath: savePath)
-            } else {
-                _ = try await api.createHTTP(url: trimmed, savePath: savePath)
+                onCreated()
+                dismiss()
+                return
             }
+            // 分享文本识别（基线 = LiuZhuan）：URL / BV 号兜底；识别不出则如实报错
+            let parsed = ShareParser.parse(trimmed)
+            guard let url = parsed.urls.first else {
+                error = "未识别到链接：请粘贴分享文字、http(s) 链接或 magnet"
+                return
+            }
+            _ = try await api.createHTTP(url: url, savePath: savePath)
             onCreated()
             dismiss()
         } catch {

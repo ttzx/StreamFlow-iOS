@@ -1,5 +1,22 @@
 import Foundation
 import Network
+import SwiftUI
+
+/// 中继事件日志（真机反馈「先查中继日志」）：App 内可见的环形缓冲，
+/// 投屏 0% 时可直接在 SMBCastSheet 里看「电视是否连上来、请求与响应长什么样」。
+@MainActor
+final class RelayLog: ObservableObject {
+    static let shared = RelayLog()
+    @Published private(set) var lines: [String] = []
+
+    func append(_ text: String) {
+        let t = Date().formatted(date: .omitted, time: .standard)
+        lines.append("[\(t)] \(text)")
+        if lines.count > 40 {
+            lines.removeFirst(lines.count - 40)
+        }
+    }
+}
 
 /// 视频扩展名 → MIME（投屏中继 Content-Type；也用于判定「可投屏」入口）
 enum SMBVideoMime {
@@ -109,6 +126,7 @@ final class CastRelayServer: @unchecked Sendable {
         sessions.removeAll()
         sessions[token] = Session(path: path, size: size, mime: mime)
         lock.unlock()
+        Task { @MainActor in RelayLog.shared.append("登记投屏：\(path)（\(size)B, \(mime)）") }
         return "/media/\(token)"
     }
 
@@ -133,6 +151,8 @@ final class CastRelayServer: @unchecked Sendable {
     // MARK: - 连接处理
 
     private func handle(_ connection: NWConnection) {
+        let peer = connection.endpoint.debugDescription
+        Task { @MainActor in RelayLog.shared.append("电视连入：\(peer)") }
         connection.start(queue: queue)
         receiveRequestHead(connection, buffer: Data())
     }
@@ -156,10 +176,12 @@ final class CastRelayServer: @unchecked Sendable {
         }
     }
 
-    /// 解析请求头 → 取会话 → 开读句柄 → 响应并流式发送
+    /// 解析请求头 → 取会话 → 开读句柄 → 响应并流式发送。支持 GET / HEAD。
     private func dispatch(_ connection: NWConnection, head: String) {
         let lines = head.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first, requestLine.hasPrefix("GET") else {
+        guard let requestLine = lines.first,
+              requestLine.hasPrefix("GET") || requestLine.hasPrefix("HEAD") else {
+            Task { @MainActor in RelayLog.shared.append("非 GET/HEAD 请求：\(lines.first ?? "?")") }
             respondHead(connection, status: "400 Bad Request", extra: [:], length: 0)
             connection.cancel()
             return
@@ -172,6 +194,7 @@ final class CastRelayServer: @unchecked Sendable {
         let session = sessions[token]
         lock.unlock()
         guard let s = session else {
+            Task { @MainActor in RelayLog.shared.append("未知 token（会话已失效）：\(requestLine)") }
             respondHead(connection, status: "404 Not Found", extra: [:], length: 0)
             connection.cancel()
             return
@@ -208,11 +231,22 @@ final class CastRelayServer: @unchecked Sendable {
                     extra["Content-Range"] = "bytes \(start)-\(end)/\(s.size)"
                 }
                 let length = end >= start ? Int(clamping: end - start + 1) : 0
-                self.respondHead(connection, status: partial ? "206 Partial Content" : "200 OK",
-                                 extra: extra, length: length)
+                let status = partial ? "206 Partial Content" : "200 OK"
+                Task { @MainActor in
+                    RelayLog.shared.append("响应 \(requestLine)：\(status)，\(s.mime)，\(length)B")
+                }
+                self.respondHead(connection, status: status, extra: extra, length: length)
+                if requestLine.hasPrefix("HEAD") {
+                    Task { await reader.close() }
+                    connection.cancel()   // HEAD：只回元信息，不发正文
+                    return
+                }
                 await self.streamBody(connection, reader: reader,
                                       offset: start, end: end)
             } catch {
+                Task { @MainActor in
+                    RelayLog.shared.append("SMB 读取失败：\((error as? LocalizedError)?.errorDescription ?? "\(error)")")
+                }
                 connection.cancel()
             }
         }

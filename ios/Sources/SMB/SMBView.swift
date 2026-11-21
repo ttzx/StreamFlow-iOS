@@ -88,6 +88,8 @@ struct SMBView: View {
             }
         }
         .navigationTitle("选择共享")
+        .scrollDismissesKeyboardImmediately()
+        .keyboardDoneBar()
         .task { await loadShares() }
     }
 
@@ -469,6 +471,7 @@ struct SMBCastSheet: View {
     @State private var preparing = false
     @State private var showManualIP = false
     @State private var manualIP = ""
+    @ObservedObject private var relayLog = RelayLog.shared
 
     var body: some View {
         NavigationStack {
@@ -508,6 +511,16 @@ struct SMBCastSheet: View {
                                 }
                             }
                         } }
+                    }
+                }
+                Section("中继日志（排查「电视唤醒但 0%」用）") {
+                    if relayLog.lines.isEmpty {
+                        Text("暂无事件（选择设备发起投屏后出现）")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    ForEach(Array(relayLog.lines.enumerated().reversed()), id: \.offset) { _, line in
+                        Text(line).font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
                     }
                 }
                 Section("局域网设备") {
